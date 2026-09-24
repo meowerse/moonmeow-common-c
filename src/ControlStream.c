@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "MeowProtocol.h"
 
 // This is a private header, but it just contains some time macros
 #include <enet/time.h>
@@ -91,7 +92,12 @@ typedef struct _QUEUED_ASYNC_CALLBACK {
             // Captured desktop size, or 0/0 when the host did not report it.
             uint16_t desktopWidth;
             uint16_t desktopHeight;
+            // First frame with the applied rectangle, or 0 when not reported.
+            uint32_t frameIndex;
         } setViewport;
+        struct {
+            uint32_t kbps;
+        } bitrateApplied;
     } data;
     LINKED_BLOCKING_QUEUE_ENTRY entry;
 } QUEUED_ASYNC_CALLBACK, *PQUEUED_ASYNC_CALLBACK;
@@ -153,6 +159,8 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_SET_CLIPBOARD 14
 #define IDX_FILE_TRANSFER_NONCE_REQUEST 15
 #define IDX_VIEWPORT 16
+#define IDX_CURSOR 17
+#define IDX_RECEIVER_REPORT 18
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
@@ -175,6 +183,8 @@ static const short packetTypesGen3[] = {
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
     -1,     // Viewport event (unused)
+    -1,     // Cursor (unused)
+    -1,     // Receiver report (unused)
 };
 static const short packetTypesGen4[] = {
     0x0606, // Request IDR frame
@@ -194,6 +204,8 @@ static const short packetTypesGen4[] = {
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
     -1,     // Viewport event (unused)
+    -1,     // Cursor (unused)
+    -1,     // Receiver report (unused)
 };
 static const short packetTypesGen5[] = {
     0x0305, // Start A
@@ -213,6 +225,8 @@ static const short packetTypesGen5[] = {
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
     -1,     // Viewport event (unused)
+    -1,     // Cursor (unused)
+    -1,     // Receiver report (unused)
 };
 static const short packetTypesGen7[] = {
     0x0305, // Start A
@@ -232,6 +246,8 @@ static const short packetTypesGen7[] = {
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
     -1,     // Viewport event (unused)
+    -1,     // Cursor (unused)
+    -1,     // Receiver report (unused)
 };
 static const short packetTypesGen7Enc[] = {
     0x0302, // Request IDR frame
@@ -251,6 +267,8 @@ static const short packetTypesGen7Enc[] = {
     0x3001, // Set Clipboard (Apollo protocol extension)
     0x3002, // File transfer nonce request (Apollo protocol extension)
     0x3003, // Viewport event (Apollo protocol extension)
+    0x3004, // Cursor (meow protocol extension)
+    0x3005, // Receiver report (meow protocol extension)
 };
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
@@ -346,16 +364,20 @@ static bool supportsIdrFrameRequest;
 // The request payload is 10 bytes, little endian (matching every other control
 // stream payload in this file):
 //   uint8  version (VIEWPORT_PAYLOAD_VERSION)
-//   uint8  flags   (VIEWPORT_FLAG_* bits; 0 on a request)
+//   uint8  flags   (MEOW_VIEWPORT_FLAG_* bits; 0 on a request)
 //   uint16 x
 //   uint16 y
 //   uint16 width
 //   uint16 height
 //
 // The host's echo uses the same layout, plus two fields guarded by
-// VIEWPORT_FLAG_DESKTOP_EXTENT:
+// MEOW_VIEWPORT_FLAG_DESKTOP_EXTENT:
 //   uint16 desktopWidth
 //   uint16 desktopHeight
+// and one more guarded by MEOW_VIEWPORT_FLAG_FRAME_INDEX ("echo v2"):
+//   uint32 frameIndex
+// The echo is parsed and validated by meowParseViewportEcho() in
+// MeowProtocol.h.
 //
 // There is no negotiation of this version: a receiver that doesn't recognise it
 // discards the message entirely rather than parsing it field by field. So
@@ -363,17 +385,8 @@ static bool supportsIdrFrameRequest;
 // older version, instead of degrading it. Prefer the reserved flags byte for
 // additive changes and keep the version bump for layout changes that genuinely
 // cannot be parsed by an older peer.
-#define VIEWPORT_PAYLOAD_VERSION 1
-#define VIEWPORT_PAYLOAD_LENGTH 10
-
-// Flag bit meaning "uint16 desktopWidth, uint16 desktopHeight follow the
-// rectangle". Only ever set on an echo from the host.
-#define VIEWPORT_FLAG_DESKTOP_EXTENT 0x01
-
-// All flag bits this version knows how to act on. A message carrying anything
-// outside this mask came from a peer that expects us to understand a field we
-// do not, so the extra fields are ignored rather than guessed at.
-#define VIEWPORT_KNOWN_FLAGS VIEWPORT_FLAG_DESKTOP_EXTENT
+#define VIEWPORT_PAYLOAD_VERSION MEOW_VIEWPORT_VERSION
+#define VIEWPORT_PAYLOAD_LENGTH MEOW_VIEWPORT_REQUEST_LENGTH
 
 // Viewport updates can be generated on every animation frame while the user is
 // panning or pinch-zooming. sendMessageEnet() blocks the calling thread for up
@@ -396,6 +409,17 @@ static bool viewportPending;
 static bool viewportEverSent;
 static uint64_t viewportLastSendTimeMs;
 
+// Cursor position state (0x3004).
+//
+// Positions can arrive at up to 60 Hz and only the latest one matters, so they
+// are not queued one by one: the receive thread overwrites cursorLatest and
+// queues a single async callback only if none is already outstanding. That
+// bounds both the allocations and the share of asyncCallbackQueue the cursor can
+// take, so a slow callback can never crowd out rumble or HDR events.
+static PLT_MUTEX cursorMutex;
+static MEOW_CURSOR_POSITION cursorLatest;
+static bool cursorCallbackQueued;
+
 #define LOSS_REPORT_INTERVAL_MS 50
 #define PERIODIC_PING_INTERVAL_MS 100
 
@@ -408,6 +432,7 @@ int initializeControlStream(void) {
     LbqInitializeLinkedBlockingQueue(&asyncCallbackQueue, 30);
     PltCreateMutex(&enetMutex);
     PltCreateMutex(&viewportMutex);
+    PltCreateMutex(&cursorMutex);
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
 
@@ -469,6 +494,9 @@ int initializeControlStream(void) {
     // than the interval.
     viewportLastSendTimeMs = PltGetMillis() - VIEWPORT_MIN_SEND_INTERVAL_MS;
 
+    memset(&cursorLatest, 0, sizeof(cursorLatest));
+    cursorCallbackQueued = false;
+
     return 0;
 }
 
@@ -494,6 +522,7 @@ void destroyControlStream(void) {
 
     PltDeleteMutex(&enetMutex);
     PltDeleteMutex(&viewportMutex);
+    PltDeleteMutex(&cursorMutex);
 }
 
 static void queueFrameInvalidationTuple(uint32_t startFrame, uint32_t endFrame) {
@@ -1137,12 +1166,42 @@ static void asyncCallbackThreadFunc(void* context) {
                 queuedCb = nextCb;
             }
 
-            ListenerCallbacks.setViewport(queuedCb->data.setViewport.x,
-                                          queuedCb->data.setViewport.y,
-                                          queuedCb->data.setViewport.width,
-                                          queuedCb->data.setViewport.height,
-                                          queuedCb->data.setViewport.desktopWidth,
-                                          queuedCb->data.setViewport.desktopHeight);
+            // setViewportV2 forwards to setViewport unless the caller set it
+            ListenerCallbacks.setViewportV2(queuedCb->data.setViewport.x,
+                                            queuedCb->data.setViewport.y,
+                                            queuedCb->data.setViewport.width,
+                                            queuedCb->data.setViewport.height,
+                                            queuedCb->data.setViewport.desktopWidth,
+                                            queuedCb->data.setViewport.desktopHeight,
+                                            queuedCb->data.setViewport.frameIndex);
+            break;
+        case IDX_CURSOR: {
+            MEOW_CURSOR_POSITION position;
+
+            // The entry itself carries nothing; take the latest position and let
+            // the receive thread queue a new entry for anything newer.
+            PltLockMutex(&cursorMutex);
+            position = cursorLatest;
+            cursorCallbackQueued = false;
+            PltUnlockMutex(&cursorMutex);
+
+            ListenerCallbacks.cursorPosition(position.x, position.y, position.visible, position.seq);
+            break;
+        }
+        case IDX_RECEIVER_REPORT:
+            // Only the most recent applied bitrate is meaningful
+            while (LbqPeekQueueElement(&asyncCallbackQueue, (void**)&nextCb) == LBQ_SUCCESS && nextCb->typeIndex == queuedCb->typeIndex) {
+                // This entry is batchable, so pop it off the queue
+                if (LbqPollQueueElement(&asyncCallbackQueue, (void**)&nextCb) != LBQ_SUCCESS) {
+                    break;
+                }
+
+                // Replace the old entry with the new one
+                free(queuedCb);
+                queuedCb = nextCb;
+            }
+
+            ListenerCallbacks.bitrateApplied(queuedCb->data.bitrateApplied.kbps);
             break;
         default:
             // Unhandled packet type from queueAsyncCallback()
@@ -1163,7 +1222,50 @@ static bool needsAsyncCallback(unsigned short packetType) {
            packetType == packetTypes[IDX_DS_ADAPTIVE_TRIGGERS] ||
            packetType == packetTypes[IDX_SET_CLIPBOARD] ||
            packetType == packetTypes[IDX_FILE_TRANSFER_NONCE_REQUEST] ||
-           packetType == packetTypes[IDX_VIEWPORT];
+           packetType == packetTypes[IDX_VIEWPORT] ||
+           packetType == packetTypes[IDX_CURSOR] ||
+           packetType == packetTypes[IDX_RECEIVER_REPORT];
+}
+
+// Handles a 0x3004 cursor POSITION. See cursorLatest for why this does not go
+// through the ordinary one-entry-per-message path.
+static void queueCursorCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
+    MEOW_CURSOR_POSITION position;
+    PQUEUED_ASYNC_CALLBACK queuedCb;
+    int err;
+
+    err = meowParseCursorPosition((const uint8_t*)&ctlHdr[1], packetLength - sizeof(*ctlHdr), &position);
+    if (err != MEOW_PARSE_OK) {
+        Limelog("Discarding malformed cursor message (%d bytes): %d\n", (int)(packetLength - sizeof(*ctlHdr)), err);
+        return;
+    }
+
+    PltLockMutex(&cursorMutex);
+    cursorLatest = position;
+    if (cursorCallbackQueued) {
+        // The outstanding entry will pick this position up
+        PltUnlockMutex(&cursorMutex);
+        return;
+    }
+    cursorCallbackQueued = true;
+    PltUnlockMutex(&cursorMutex);
+
+    queuedCb = malloc(sizeof(*queuedCb));
+    if (queuedCb != NULL) {
+        queuedCb->typeIndex = IDX_CURSOR;
+        err = LbqOfferQueueItem(&asyncCallbackQueue, queuedCb, &queuedCb->entry);
+        if (err == LBQ_SUCCESS) {
+            return;
+        }
+
+        Limelog("Failed to queue async callback: %d\n", err);
+        free(queuedCb);
+    }
+
+    // Nothing is outstanding, so let the next position try again
+    PltLockMutex(&cursorMutex);
+    cursorCallbackQueued = false;
+    PltUnlockMutex(&cursorMutex);
 }
 
 static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
@@ -1172,6 +1274,11 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
     int err;
 
     LC_ASSERT(needsAsyncCallback(ctlHdr->type));
+
+    if (ctlHdr->type == packetTypes[IDX_CURSOR]) {
+        queueCursorCallback(ctlHdr, packetLength);
+        return;
+    }
 
     queuedCb = malloc(sizeof(*queuedCb));
     if (!queuedCb) {
@@ -1225,61 +1332,42 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
         queuedCb->typeIndex = IDX_DS_ADAPTIVE_TRIGGERS;
     }
     else if (ctlHdr->type == packetTypes[IDX_VIEWPORT]) {
-        uint8_t version;
-        uint8_t flags;
+        MEOW_VIEWPORT_ECHO echo;
 
         // Reject anything we can't fully parse rather than acting on garbage
-        if (!BbGet8(&bb, &version) ||
-                !BbGet8(&bb, &flags) ||
-                !BbGet16(&bb, &queuedCb->data.setViewport.x) ||
-                !BbGet16(&bb, &queuedCb->data.setViewport.y) ||
-                !BbGet16(&bb, &queuedCb->data.setViewport.width) ||
-                !BbGet16(&bb, &queuedCb->data.setViewport.height)) {
-            Limelog("Discarding truncated viewport message\n");
+        err = meowParseViewportEcho((const uint8_t*)&ctlHdr[1], packetLength - sizeof(*ctlHdr), &echo);
+        if (err != MEOW_PARSE_OK) {
+            Limelog("Discarding malformed viewport message (%d bytes): %d\n", (int)(packetLength - sizeof(*ctlHdr)), err);
             free(queuedCb);
             return;
         }
 
-        if (version != VIEWPORT_PAYLOAD_VERSION) {
-            Limelog("Discarding viewport message with unsupported version: %u\n", version);
-            free(queuedCb);
-            return;
+        // Bits outside MEOW_VIEWPORT_KNOWN_FLAGS belong to fields added after
+        // this build. The rectangle is still valid and is delivered; the
+        // trailing bytes are ignored, which is exactly how this format is meant
+        // to grow without a version bump.
+        if (echo.unknownFlags) {
+            Limelog("Ignoring unknown viewport flags: 0x%02x\n", echo.unknownFlags);
         }
 
-        if (queuedCb->data.setViewport.width == 0 || queuedCb->data.setViewport.height == 0) {
-            Limelog("Discarding viewport message with an empty rectangle\n");
-            free(queuedCb);
-            return;
-        }
-
-        // The captured desktop size is optional and host-supplied, so it is read
-        // only when the host says it is there and only if it is actually there.
-        // A flag without the bytes behind it is a malformed message rather than a
-        // reason to read past the payload, and a zero extent is meaningless; both
-        // fall back to "unknown" (0/0) rather than discarding an otherwise valid
-        // rectangle.
-        queuedCb->data.setViewport.desktopWidth = 0;
-        queuedCb->data.setViewport.desktopHeight = 0;
-        if (flags & VIEWPORT_FLAG_DESKTOP_EXTENT) {
-            if (!BbGet16(&bb, &queuedCb->data.setViewport.desktopWidth) ||
-                    !BbGet16(&bb, &queuedCb->data.setViewport.desktopHeight) ||
-                    queuedCb->data.setViewport.desktopWidth == 0 ||
-                    queuedCb->data.setViewport.desktopHeight == 0) {
-                Limelog("Viewport message claimed a desktop extent it did not carry\n");
-                queuedCb->data.setViewport.desktopWidth = 0;
-                queuedCb->data.setViewport.desktopHeight = 0;
-            }
-        }
-
-        // Bits outside VIEWPORT_KNOWN_FLAGS belong to fields added after this
-        // build. The rectangle is still valid and is delivered; the trailing
-        // bytes are ignored, which is exactly how this format is meant to grow
-        // without a version bump.
-        if (flags & ~(uint8_t)VIEWPORT_KNOWN_FLAGS) {
-            Limelog("Ignoring unknown viewport flags: 0x%02x\n", flags & ~(unsigned)VIEWPORT_KNOWN_FLAGS);
-        }
-
+        queuedCb->data.setViewport.x = echo.x;
+        queuedCb->data.setViewport.y = echo.y;
+        queuedCb->data.setViewport.width = echo.width;
+        queuedCb->data.setViewport.height = echo.height;
+        queuedCb->data.setViewport.desktopWidth = echo.desktopWidth;
+        queuedCb->data.setViewport.desktopHeight = echo.desktopHeight;
+        queuedCb->data.setViewport.frameIndex = echo.frameIndex;
         queuedCb->typeIndex = IDX_VIEWPORT;
+    }
+    else if (ctlHdr->type == packetTypes[IDX_RECEIVER_REPORT]) {
+        err = meowParseBitrateApplied((const uint8_t*)&ctlHdr[1], packetLength - sizeof(*ctlHdr), &queuedCb->data.bitrateApplied.kbps);
+        if (err != MEOW_PARSE_OK) {
+            Limelog("Discarding malformed bitrate applied message (%d bytes): %d\n", (int)(packetLength - sizeof(*ctlHdr)), err);
+            free(queuedCb);
+            return;
+        }
+
+        queuedCb->typeIndex = IDX_RECEIVER_REPORT;
     }
     else {
         // Unhandled packet type from needsAsyncCallback()
@@ -2486,6 +2574,58 @@ int LiSendViewportEvent(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
 
 int LiSendViewportEventForced(uint16_t x, uint16_t y, uint16_t width, uint16_t height) {
     return sendViewportEventInternal(x, y, width, height, true);
+}
+
+// Sends one of the meow control extensions (0x3004, 0x3005) reliably on the
+// server control channel. Safe to call from any thread: sendMessageEnet()
+// serializes on enetMutex. The checks mirror sendViewportEventInternal(),
+// including its caveat that 0 is not a capability signal.
+static int sendMeowControlMessage(int typeIndex, const uint8_t* payload, short payloadLength) {
+    // No control stream has been set up at all
+    if (packetTypes == NULL) {
+        return -2;
+    }
+
+    // This host's generation has no entry for the extension (GFE Gen 3/4/5 and
+    // unencrypted Gen 7), so there is not even a number to send
+    if (packetTypes[typeIndex] == -1) {
+        return -3;
+    }
+
+    // Like LiGetEstimatedRttInfo(), a convenience check rather than a
+    // synchronization point
+    if (peer == NULL || peer->state != ENET_PEER_STATE_CONNECTED) {
+        return -2;
+    }
+
+    if (!sendMessageAndForget(packetTypes[typeIndex],
+                              payloadLength,
+                              payload,
+                              CTRL_CHANNEL_SERVERCTL,
+                              ENET_PACKET_FLAG_RELIABLE,
+                              false)) {
+        return -1;
+    }
+
+    return 0;
+}
+
+int LiSendCursorSubscribe(bool subscribe) {
+    uint8_t payload[MEOW_CURSOR_SUBSCRIBE_LENGTH];
+
+    meowEncodeCursorSubscribe(payload, subscribe);
+    return sendMeowControlMessage(IDX_CURSOR, payload, sizeof(payload));
+}
+
+int LiSendReceiverReport(const MEOW_RECEIVER_REPORT* report) {
+    uint8_t payload[MEOW_RECEIVER_REPORT_LENGTH];
+
+    if (report == NULL) {
+        return -1;
+    }
+
+    meowEncodeReceiverReport(payload, report);
+    return sendMeowControlMessage(IDX_RECEIVER_REPORT, payload, sizeof(payload));
 }
 
 // Send an empty keepalive payload to the streaming machine

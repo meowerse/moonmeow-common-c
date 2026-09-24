@@ -29,6 +29,10 @@ jobs:
       - name: Check packet type table alignment
         run: python3 tools/check-packet-type-tables.py
 
+      # Wire codecs for the meow control extensions (0x3003-0x3005)
+      - name: Meow protocol tests
+        run: make -C tests/meow
+
   build:
     strategy:
       fail-fast: false

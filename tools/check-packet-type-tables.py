@@ -10,6 +10,11 @@ rather than by eye.
 Asserts:
   1. All five packetTypesGen* arrays exist and have identical length.
   2. Every IDX_* constant is in bounds for that length.
+  3. No packet type number appears twice within one array.
+  4. No packet type number is one that Sunshine or Apollo use for a message
+     this library does not implement (FOREIGN_PACKET_TYPES). Our own protocol
+     extensions (0x3003-0x3005) share the host's number space, so a collision
+     would make one host message be parsed as another.
 
 Exits non-zero on failure.
 """
@@ -29,6 +34,15 @@ EXPECTED_ARRAYS = [
     "packetTypesGen7Enc",
 ]
 
+# Control stream packet types that Sunshine (LizardByte/Sunshine src/stream.cpp)
+# or Apollo (ClassicOldSong/Apollo src/stream.cpp) define but that have no entry
+# in our tables. Types both sides already share (0x5500-0x5503, 0x3000-0x3002)
+# are in the tables themselves and covered by the uniqueness check. Re-check
+# both hosts' packetTypes arrays before adding a new extension number.
+FOREIGN_PACKET_TYPES = {
+    0x5504: "Sunshine: set player indicator LEDs",
+}
+
 ARRAY_RE = re.compile(
     r"static\s+const\s+short\s+(packetTypesGen\w*)\s*\[\s*\]\s*=\s*\{(.*?)\};",
     re.DOTALL,
@@ -42,10 +56,17 @@ def count_entries(body):
     return len([e for e in body.split(",") if e.strip()])
 
 
+def entry_values(body):
+    # Integer values of the entries, in order (-1 for unused slots).
+    body = re.sub(r"//[^\n]*", "", body)
+    return [int(e.strip(), 0) for e in body.split(",") if e.strip()]
+
+
 def main():
     source = open(SOURCE, encoding="utf-8").read()
 
-    arrays = {name: count_entries(body) for name, body in ARRAY_RE.findall(source)}
+    bodies = dict(ARRAY_RE.findall(source))
+    arrays = {name: count_entries(body) for name, body in bodies.items()}
     indices = {name: int(value) for name, value in IDX_RE.findall(source)}
 
     failures = []
@@ -77,6 +98,18 @@ def main():
         if not ok:
             failures.append("%s = %d is out of bounds (0..%d)" % (name, value, bound - 1))
         print("  %-36s %2d  %s" % (name, value, "ok" if ok else "OUT OF BOUNDS"))
+
+    print("\npacket type numbers:")
+    for name in sorted(bodies):
+        values = [v for v in entry_values(bodies[name]) if v != -1]
+        dupes = sorted({v for v in values if values.count(v) > 1})
+        foreign = sorted(v for v in values if v in FOREIGN_PACKET_TYPES)
+        for v in dupes:
+            failures.append("%s uses 0x%04x more than once" % (name, v))
+        for v in foreign:
+            failures.append("%s uses 0x%04x, which is taken (%s)"
+                            % (name, v, FOREIGN_PACKET_TYPES[v]))
+        print("  %-20s %s" % (name, "ok" if not dupes and not foreign else "COLLISION"))
 
     print("")
     if failures:

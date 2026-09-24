@@ -42,6 +42,15 @@ static void fakeClSetMotionEventState(uint16_t controllerNumber, uint8_t motionT
 static void fakeClSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlags, uint8_t typeLeft, uint8_t typeRight, uint8_t *left, uint8_t *right) {};
 static void fakeClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b) {}
 static void fakeClSetViewport(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t desktopWidth, uint16_t desktopHeight) {}
+static void fakeClCursorPosition(uint16_t x, uint16_t y, bool visible, uint16_t seq) {}
+static void fakeClBitrateApplied(uint32_t kbps) {}
+
+// Callers that only implement the v1 viewport callback keep receiving echoes
+// through it. ListenerCallbacks is the post-fixup copy, so setViewport is never
+// NULL by the time this runs.
+static void fakeClSetViewportV2(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t desktopWidth, uint16_t desktopHeight, uint32_t frameIndex) {
+    ListenerCallbacks.setViewport(x, y, width, height, desktopWidth, desktopHeight);
+}
 
 static CONNECTION_LISTENER_CALLBACKS fakeClCallbacks = {
     .stageStarting = fakeClStageStarting,
@@ -58,6 +67,9 @@ static CONNECTION_LISTENER_CALLBACKS fakeClCallbacks = {
     .setControllerLED = fakeClSetControllerLED,
     .setAdaptiveTriggers = fakeClSetAdaptiveTriggers,
     .setViewport = fakeClSetViewport,
+    .setViewportV2 = fakeClSetViewportV2,
+    .cursorPosition = fakeClCursorPosition,
+    .bitrateApplied = fakeClBitrateApplied,
 };
 
 void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_RENDERER_CALLBACKS* arCallbacks,
@@ -150,6 +162,15 @@ void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_REND
         }
         if ((*clCallbacks)->setViewport == NULL) {
             (*clCallbacks)->setViewport = fakeClSetViewport;
+        }
+        if ((*clCallbacks)->setViewportV2 == NULL) {
+            (*clCallbacks)->setViewportV2 = fakeClSetViewportV2;
+        }
+        if ((*clCallbacks)->cursorPosition == NULL) {
+            (*clCallbacks)->cursorPosition = fakeClCursorPosition;
+        }
+        if ((*clCallbacks)->bitrateApplied == NULL) {
+            (*clCallbacks)->bitrateApplied = fakeClBitrateApplied;
         }
     }
 }
