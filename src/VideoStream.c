@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "MeowProtocol.h"
 
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
@@ -19,6 +20,11 @@ static PLT_THREAD decoderThread;
 static bool receivedDataFromPeer;
 static uint64_t firstDataTimeMs;
 static bool receivedFullFrame;
+
+// Network-level video counters for LiGetMeowVideoNetworkStats(). Written only by
+// the receive thread.
+static MEOW_VIDEO_NETWORK_STATS meowNetworkStats;
+static MEOW_SEQUENCE_TRACKER meowSequenceTracker;
 
 // We can't request an IDR frame until the depacketizer knows
 // that a packet was lost. This timeout bounds the time that
@@ -42,6 +48,8 @@ void initializeVideoStream(void) {
     receivedDataFromPeer = false;
     firstDataTimeMs = 0;
     receivedFullFrame = false;
+    memset(&meowNetworkStats, 0, sizeof(meowNetworkStats));
+    memset(&meowSequenceTracker, 0, sizeof(meowSequenceTracker));
 }
 
 // Clean up the video stream
@@ -181,6 +189,13 @@ static void VideoReceiveThreadProc(void* context) {
             continue;
         }
 
+        // Count arrivals before the stale-frame check below, which drops the
+        // late FEC shards of an already reassembled frame without decrypting
+        // them. Those shards still arrived, and the sequence numbers they cover
+        // are counted as expected, so skipping them here would read as loss.
+        meowNetworkStats.packetsReceived++;
+        meowNetworkStats.bytesReceived += (uint32_t)err;
+
         // Decrypt the packet into the buffer if encryption is enabled
         if (encrypted) {
             PENC_VIDEO_HEADER encHeader = (PENC_VIDEO_HEADER)encryptedBuffer;
@@ -226,6 +241,9 @@ static void VideoReceiveThreadProc(void* context) {
         packet->sequenceNumber = BE16(packet->sequenceNumber);
         packet->timestamp = BE32(packet->timestamp);
         packet->ssrc = BE32(packet->ssrc);
+
+        // Only authenticated sequence numbers advance the expected count
+        meowNetworkStats.packetsExpected += meowTrackSequenceNumber(&meowSequenceTracker, packet->sequenceNumber);
 
         queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
 
@@ -416,4 +434,10 @@ int startVideoStream(void* rendererContext, int drFlags) {
 
 const RTP_VIDEO_STATS* LiGetRTPVideoStats(void) {
     return &rtpQueue.stats;
+}
+
+void LiGetMeowVideoNetworkStats(PMEOW_VIDEO_NETWORK_STATS stats) {
+    if (stats != NULL) {
+        *stats = meowNetworkStats;
+    }
 }

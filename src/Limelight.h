@@ -510,6 +510,43 @@ typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r
 typedef void(*ConnListenerSetViewport)(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
                                        uint16_t desktopWidth, uint16_t desktopHeight);
 
+// As ConnListenerSetViewport, plus the frame the applied rectangle takes effect
+// on. This is the "echo v2" form of the same 0x3003 message.
+//
+// frameIndex is the host video frame number (the same number delivered in
+// DECODE_UNIT.frameNumber) of the FIRST encoded frame produced with the applied
+// rectangle, so a caller can swap its local compensation for the host crop on
+// exactly that frame. It is 0 when the host did not report it (an echo v1
+// host); real frame numbers start at 1, so "apply once frameNumber >=
+// frameIndex" degenerates to "apply on receipt" without a special case.
+//
+// Backward compatibility: if this callback is left NULL it defaults to a
+// forwarder that calls setViewport with the first six arguments, so existing
+// callers keep working unchanged. If it is set, setViewport is NOT called for
+// the same echo.
+//
+// Like setViewport, echoes still queued behind a newer one when the callback
+// thread gets to them are dropped, so a caller can see frameIndex jump past an
+// intermediate echo. Only the latest applied rectangle is ever delivered.
+typedef void(*ConnListenerSetViewportV2)(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+                                         uint16_t desktopWidth, uint16_t desktopHeight,
+                                         uint32_t frameIndex);
+
+// This callback is invoked when a host the caller subscribed to with
+// LiSendCursorSubscribe(true) reports the position of its cursor (0x3004).
+//
+// x and y are the cursor HOTSPOT in the same reference space as the viewport
+// messages: the negotiated stream resolution, uncropped, including the host's
+// aspect-ratio padding. They are clamped to the frame by the host. visible is
+// false while the host cursor is hidden. seq is incremented by the host for
+// every message it sends and wraps; the library may coalesce positions that
+// arrive faster than the callback consumes them, so seq can skip.
+typedef void(*ConnListenerCursorPosition)(uint16_t x, uint16_t y, bool visible, uint16_t seq);
+
+// This callback is invoked when the host changes the video encoder bitrate in
+// response to LiSendReceiverReport() (0x3005 APPLIED). kbps is never 0.
+typedef void(*ConnListenerBitrateApplied)(uint32_t kbps);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -535,6 +572,9 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     // against the matching header; the library cannot be swapped underneath a
     // caller compiled against a different version of this struct.
     ConnListenerSetViewport setViewport;
+    ConnListenerSetViewportV2 setViewportV2;
+    ConnListenerCursorPosition cursorPosition;
+    ConnListenerBitrateApplied bitrateApplied;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -681,6 +721,74 @@ int LiSendViewportEvent(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
 // Same return values as LiSendViewportEvent(), and the same caveat: 0 is not a
 // capability signal.
 int LiSendViewportEventForced(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
+
+// This function asks the host to start (subscribe = true) or stop (false)
+// reporting its cursor position through ConnListenerCursorPosition (0x3004).
+// A host that implements it answers a subscribe with the current position
+// straight away, so, like the viewport echo, the first callback is the only
+// capability signal: a return of 0 means the message was sent, not that the
+// host understood it.
+//
+// The subscription does not survive the connection. Call it again after every
+// LiStartConnection().
+//
+// Nothing tells the client in advance whether a host implements this, and a
+// host that doesn't silently ignores the message. Callers that want stock hosts
+// never to see it should only send it once the host has proven it runs the meow
+// extensions (e.g. after a ConnListenerSetViewport/V2 echo).
+//
+// This may be called from any thread between LiStartConnection() and
+// LiStopConnection(). It sends a reliable message and can block the caller for
+// up to ~10 ms under backpressure.
+//
+// Returns 0 if the message was sent.
+// Returns -1 if the message could not be sent.
+// Returns -2 if the control stream is not connected.
+// Returns -3 if this host's packet-type table has no entry for it.
+int LiSendCursorSubscribe(bool subscribe);
+
+// Client-side receiver statistics for one reporting interval, sent to the host
+// with LiSendReceiverReport() (0x3005) so it can adapt the encoder bitrate.
+// Send one report every ~1000 ms while streaming.
+typedef struct _MEOW_RECEIVER_REPORT {
+    // The user wants the host to adapt the bitrate automatically
+    bool autoBitrate;
+
+    // Length of the interval these statistics cover
+    uint16_t intervalMs;
+
+    // Video goodput over the interval, including FEC parity
+    uint32_t receivedKbps;
+
+    // Network-lost video packets per 1000 expected, before FEC recovery.
+    // Values above 1000 are clamped to 1000 on the wire.
+    uint16_t lossPermille;
+
+    // Round-trip time and its variance (see LiGetEstimatedRttInfo())
+    uint16_t rttMs;
+    uint16_t rttVarianceMs;
+
+    // Decoded-but-not-yet-rendered backlog and average decode time
+    uint16_t decodeQueueFrames;
+    uint16_t avgDecodeMs;
+
+    // The client's bitrate ceiling, or 0 to use the negotiated bitrate as the
+    // ceiling
+    uint32_t maxKbps;
+} MEOW_RECEIVER_REPORT, *PMEOW_RECEIVER_REPORT;
+
+// This function sends a receiver report to the host. The host answers bitrate
+// changes through ConnListenerBitrateApplied. Hosts that don't implement the
+// extension ignore it; see LiSendCursorSubscribe() for gating on a proven meow
+// host, and consider stopping when no ConnListenerBitrateApplied has arrived
+// after the first few reports.
+//
+// This may be called from any thread between LiStartConnection() and
+// LiStopConnection(). It sends a reliable message and can block the caller for
+// up to ~10 ms under backpressure.
+//
+// Same return values as LiSendCursorSubscribe(), plus -1 if report is NULL.
+int LiSendReceiverReport(const MEOW_RECEIVER_REPORT* report);
 
 // This function queues a relative mouse move event to be sent to the remote server.
 int LiSendMouseMoveEvent(short deltaX, short deltaY);
@@ -1016,6 +1124,36 @@ typedef struct _RTP_VIDEO_STATS {
 } RTP_VIDEO_STATS, *PRTP_VIDEO_STATS;
 
 const RTP_VIDEO_STATS* LiGetRTPVideoStats(void);
+
+// Free-running counters of video packets at the network level, for computing
+// pre-FEC loss and goodput for LiSendReceiverReport(). Every field counts up
+// from 0 at the start of the connection and wraps modulo 2^32, so take the
+// difference between two snapshots with unsigned 32-bit arithmetic:
+//
+//   expected = now.packetsExpected - last.packetsExpected
+//   lost     = expected - (now.packetsReceived - last.packetsReceived)
+//
+// lost can come out slightly negative (duplicates, packets straddling the
+// snapshot), so clamp it at 0. The fields are updated by the video receive
+// thread without a lock, so a snapshot is not atomic across fields; the skew is
+// at most a few packets.
+//
+// packetsExpected advances with the RTP sequence numbers of received packets
+// (authenticated when video encryption is enabled), so packets lost during an
+// outage are counted once the stream resumes. packetsReceived and
+// bytesReceived count every well-sized datagram on the video socket, before
+// decryption, because the late FEC shards of an already reassembled frame are
+// dropped undecrypted; bytesReceived therefore includes the per-packet
+// encryption header when video encryption is enabled.
+typedef struct _MEOW_VIDEO_NETWORK_STATS {
+    uint32_t packetsReceived;  // video data and FEC packets that arrived
+    uint32_t packetsExpected;  // video data and FEC packets the host sent
+    uint32_t bytesReceived;    // UDP payload bytes of packetsReceived
+} MEOW_VIDEO_NETWORK_STATS, *PMEOW_VIDEO_NETWORK_STATS;
+
+// Copies the current counters into stats. May be called from any thread
+// between LiStartConnection() and LiStopConnection().
+void LiGetMeowVideoNetworkStats(PMEOW_VIDEO_NETWORK_STATS stats);
 
 // Port index flags for use with LiGetPortFromPortFlagIndex() and LiGetProtocolFromPortFlagIndex()
 #define ML_PORT_INDEX_TCP_47984 0
