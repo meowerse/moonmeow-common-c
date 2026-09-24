@@ -329,6 +329,45 @@ static void testSequenceTracker(void) {
     CHECK_EQ(expected, 4);
     expected += meowTrackSequenceNumber(&t, 0xFFFF); // old
     CHECK_EQ(expected, 4);
+
+    // A 40000-packet outage lands more than half the space ahead. The first
+    // packet after it is ambiguous; the next consecutive one confirms the jump
+    // and the whole gap is counted, rather than stalling until the wrap.
+    memset(&t, 0, sizeof(t));
+    expected = meowTrackSequenceNumber(&t, 100);
+    expected += meowTrackSequenceNumber(&t, 101);
+    expected += meowTrackSequenceNumber(&t, 40101);
+    CHECK_EQ(expected, 2);
+    expected += meowTrackSequenceNumber(&t, 40102);
+    CHECK_EQ(expected, 40003);
+    expected += meowTrackSequenceNumber(&t, 40103);
+    CHECK_EQ(expected, 40004);
+
+    // Same outage, but the confirming packet was lost: the probe restarts on
+    // the next packet and the jump is still counted in full
+    memset(&t, 0, sizeof(t));
+    expected = meowTrackSequenceNumber(&t, 100);
+    expected += meowTrackSequenceNumber(&t, 40101);
+    expected += meowTrackSequenceNumber(&t, 40103);
+    CHECK_EQ(expected, 1);
+    expected += meowTrackSequenceNumber(&t, 40104);
+    CHECK_EQ(expected, 40005);
+
+    // Reordering within MEOW_SEQUENCE_MAX_MISORDER never counts, even twice
+    memset(&t, 0, sizeof(t));
+    expected = meowTrackSequenceNumber(&t, 10000);
+    expected += meowTrackSequenceNumber(&t, 10000 - MEOW_SEQUENCE_MAX_MISORDER);
+    expected += meowTrackSequenceNumber(&t, 10001 - MEOW_SEQUENCE_MAX_MISORDER);
+    CHECK_EQ(expected, 1);
+
+    // A single stray packet far outside the window is ignored, and the
+    // stream carries on counting normally
+    memset(&t, 0, sizeof(t));
+    expected = meowTrackSequenceNumber(&t, 10000);
+    expected += meowTrackSequenceNumber(&t, 50000);
+    expected += meowTrackSequenceNumber(&t, 10001);
+    expected += meowTrackSequenceNumber(&t, 10002);
+    CHECK_EQ(expected, 3);
 }
 
 // Random payloads of random lengths: nothing crashes or over-reads (ASan), and

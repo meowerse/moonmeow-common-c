@@ -19,4 +19,4 @@ Moonlight-common-c requires the _specific_ version of ENet that is bundled as a 
 - Viewport echo v2 (frame index), cursor position (`0x3004`) and receiver report / applied bitrate (`0x3005`) — wire format in [docs/meow-protocol.md](docs/meow-protocol.md), codec tests in `tests/meow/` (`make -C tests/meow`)
 - Tracks upstream fixes (e.g., MbedTLS PSA, `LI_CTYPE_STEAM`, nanors bumps)
 
-Sync: `git fetch upstream --prune && git checkout meow && git merge --ff-only upstream/master` then `git push origin meow`.
+Sync: `git fetch real --prune && git checkout meow && git merge real/master` (never rebase or force-push `meow`: the moonmeow submodule pin must stay reachable), then `git push origin meow`. `real` is `https://github.com/moonlight-stream/moonlight-common-c.git`.

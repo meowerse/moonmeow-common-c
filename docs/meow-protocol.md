@@ -6,6 +6,12 @@ and a peer that does not implement one simply ignores it.
 
 All of them:
 
+- are opt-in: a meow client sends SUBSCRIBE / REPORT only when it chooses to,
+  and a meow host sends POSITION / APPLIED only in answer to them. Nothing
+  announces support in advance, so the first client message is itself the
+  probe; stock Sunshine/Apollo hosts log unknown control types at debug level
+  and otherwise ignore them. A client that wants stock hosts never to see them
+  gates on a proven meow host (a viewport echo) first;
 - ride the **existing encrypted ENet control stream** (the same channel and the
   same AES-GCM encryption as every other control message). No new ports,
   sockets or listeners, so nothing changes for firewalls, Tailscale ACLs or NAT;
@@ -70,7 +76,9 @@ Receive rules (client):
 - the payload must be exactly 10, 14 or 18 bytes as the flags describe.
   Only when the echo also carries flag bits this build does not know are
   trailing bytes tolerated (and ignored) — that is how the format grows without
-  a version bump;
+  a version bump. Optional fields sit at fixed offsets in flag-bit order, so
+  a host that sets flag bit N must also set every lower bit and send their
+  fields; a future bit2 field goes at offset 18;
 - a zero desktop extent is reported as "unknown" (0/0).
 
 Client API: the echo is delivered through `ConnListenerSetViewportV2(x, y,
@@ -148,7 +156,10 @@ the first report). Receive rules (client): exactly 8 bytes, version 1,
 library sees. `LiGetMeowVideoNetworkStats(PMEOW_VIDEO_NETWORK_STATS)` returns
 free-running (mod 2^32) counts of video packets received, packets expected (from
 the advance of authenticated RTP sequence numbers, data + FEC parity) and bytes
-received. Take the difference between two snapshots one interval apart:
+received. The expected count survives sequence-number wraparound after long
+outages (see `meowTrackSequenceNumber()`), and the received counts include
+late FEC shards dropped before decryption. Take the difference between two
+snapshots one interval apart:
 
 ```
 expected = now.packetsExpected - last.packetsExpected      // uint32 arithmetic

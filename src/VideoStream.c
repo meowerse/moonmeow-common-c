@@ -437,5 +437,7 @@ const RTP_VIDEO_STATS* LiGetRTPVideoStats(void) {
 }
 
 void LiGetMeowVideoNetworkStats(PMEOW_VIDEO_NETWORK_STATS stats) {
-    *stats = meowNetworkStats;
+    if (stats != NULL) {
+        *stats = meowNetworkStats;
+    }
 }

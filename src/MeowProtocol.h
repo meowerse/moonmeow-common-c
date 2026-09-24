@@ -280,31 +280,68 @@ static inline void meowEncodeReceiverReport(uint8_t out[MEOW_RECEIVER_REPORT_LEN
 // -----------------------------------------------------------------------------
 
 // Tracks how many video packets the host has sent, from the 16-bit RTP sequence
-// numbers of authenticated packets. The host numbers every video packet (data
-// and FEC parity) consecutively, so the advance of the highest sequence number
-// seen is the number of packets sent, whether or not they arrived. Reordered and
-// duplicate packets (behind the highest seen) don't advance it.
+// numbers of received packets (authenticated when video encryption is on). The
+// host numbers every video packet (data and FEC parity) consecutively, so the
+// advance of the highest sequence number seen is the number of packets sent,
+// whether or not they arrived.
+//
+// Sixteen bits wrap after 65536 packets, a few seconds at high bitrates, so an
+// outage (Wi-Fi roam, cellular stall, Tailscale DIRECT <-> DERP switch) can
+// easily move the sequence number more than half the space forward. Treating
+// that as "behind" would stop the expected count until the numbers wrap around
+// again and report zero loss exactly when loss is worst. So, as in RFC 3550
+// appendix A.1:
+//
+//  - up to MEOW_SEQUENCE_MAX_MISORDER behind the highest: a reordered or
+//    duplicate packet, which doesn't advance anything;
+//  - less than half the space ahead: an ordinary advance, gap counted;
+//  - anywhere else: ambiguous. Two consecutive packets there confirm a jump
+//    forward and the whole advance is counted; a lone packet is ignored.
+//
+// Gaps of 65536 packets or more alias and are under-counted; nothing in a
+// 16-bit sequence number can tell them apart.
+#define MEOW_SEQUENCE_MAX_MISORDER 3000
+
 typedef struct _MEOW_SEQUENCE_TRACKER {
     bool started;
+    bool probing;
     uint16_t highestSequenceNumber;
+    uint16_t probeSequenceNumber; // Confirms the jump if it arrives next
 } MEOW_SEQUENCE_TRACKER, *PMEOW_SEQUENCE_TRACKER;
 
 // Returns how many packets sequenceNumber adds to the expected count.
 static inline uint32_t meowTrackSequenceNumber(PMEOW_SEQUENCE_TRACKER tracker, uint16_t sequenceNumber) {
     uint16_t advance;
+    bool confirmsJump;
 
     if (!tracker->started) {
         tracker->started = true;
+        tracker->probing = false;
         tracker->highestSequenceNumber = sequenceNumber;
         return 1;
     }
 
     advance = (uint16_t)(sequenceNumber - tracker->highestSequenceNumber);
-    if (advance == 0 || advance >= 0x8000) {
-        // Duplicate, or behind the highest sequence number seen
+    confirmsJump = tracker->probing && sequenceNumber == tracker->probeSequenceNumber;
+    tracker->probing = false;
+
+    if (advance == 0) {
+        // Duplicate
         return 0;
     }
 
-    tracker->highestSequenceNumber = sequenceNumber;
-    return advance;
+    if (advance < 0x8000 || confirmsJump) {
+        tracker->highestSequenceNumber = sequenceNumber;
+        return advance;
+    }
+
+    if ((uint16_t)(tracker->highestSequenceNumber - sequenceNumber) <= MEOW_SEQUENCE_MAX_MISORDER) {
+        // Reordered: already counted when a later packet advanced the highest
+        return 0;
+    }
+
+    // Very late, or the first packet after a long outage. Wait for the next one.
+    tracker->probing = true;
+    tracker->probeSequenceNumber = (uint16_t)(sequenceNumber + 1);
+    return 0;
 }

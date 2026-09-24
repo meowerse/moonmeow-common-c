@@ -413,12 +413,14 @@ static uint64_t viewportLastSendTimeMs;
 //
 // Positions can arrive at up to 60 Hz and only the latest one matters, so they
 // are not queued one by one: the receive thread overwrites cursorLatest and
-// queues a single async callback only if none is already outstanding. That
-// bounds both the allocations and the share of asyncCallbackQueue the cursor can
-// take, so a slow callback can never crowd out rumble or HDR events.
+// queues cursorAsyncCallback only if it is not already outstanding. At most one
+// cursor entry is ever in asyncCallbackQueue, so a slow callback can never crowd
+// out rumble or HDR events, and since that one entry is static nothing is
+// allocated per position. It must never be passed to free().
 static PLT_MUTEX cursorMutex;
 static MEOW_CURSOR_POSITION cursorLatest;
 static bool cursorCallbackQueued;
+static QUEUED_ASYNC_CALLBACK cursorAsyncCallback;
 
 #define LOSS_REPORT_INTERVAL_MS 50
 #define PERIODIC_PING_INTERVAL_MS 100
@@ -496,6 +498,8 @@ int initializeControlStream(void) {
 
     memset(&cursorLatest, 0, sizeof(cursorLatest));
     cursorCallbackQueued = false;
+    memset(&cursorAsyncCallback, 0, sizeof(cursorAsyncCallback));
+    cursorAsyncCallback.typeIndex = IDX_CURSOR;
 
     return 0;
 }
@@ -505,7 +509,9 @@ static void freeBasicLbqList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
 
     while (entry != NULL) {
         nextEntry = entry->flink;
-        free(entry->data);
+        if (entry->data != &cursorAsyncCallback) {
+            free(entry->data);
+        }
         entry = nextEntry;
     }
 }
@@ -1186,7 +1192,9 @@ static void asyncCallbackThreadFunc(void* context) {
             PltUnlockMutex(&cursorMutex);
 
             ListenerCallbacks.cursorPosition(position.x, position.y, position.visible, position.seq);
-            break;
+
+            // queuedCb is the static cursorAsyncCallback, which must not be freed
+            continue;
         }
         case IDX_RECEIVER_REPORT:
             // Only the most recent applied bitrate is meaningful
@@ -1231,7 +1239,6 @@ static bool needsAsyncCallback(unsigned short packetType) {
 // through the ordinary one-entry-per-message path.
 static void queueCursorCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
     MEOW_CURSOR_POSITION position;
-    PQUEUED_ASYNC_CALLBACK queuedCb;
     int err;
 
     err = meowParseCursorPosition((const uint8_t*)&ctlHdr[1], packetLength - sizeof(*ctlHdr), &position);
@@ -1250,17 +1257,12 @@ static void queueCursorCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetL
     cursorCallbackQueued = true;
     PltUnlockMutex(&cursorMutex);
 
-    queuedCb = malloc(sizeof(*queuedCb));
-    if (queuedCb != NULL) {
-        queuedCb->typeIndex = IDX_CURSOR;
-        err = LbqOfferQueueItem(&asyncCallbackQueue, queuedCb, &queuedCb->entry);
-        if (err == LBQ_SUCCESS) {
-            return;
-        }
-
-        Limelog("Failed to queue async callback: %d\n", err);
-        free(queuedCb);
+    err = LbqOfferQueueItem(&asyncCallbackQueue, &cursorAsyncCallback, &cursorAsyncCallback.entry);
+    if (err == LBQ_SUCCESS) {
+        return;
     }
+
+    Limelog("Failed to queue async callback: %d\n", err);
 
     // Nothing is outstanding, so let the next position try again
     PltLockMutex(&cursorMutex);

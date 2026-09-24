@@ -524,6 +524,10 @@ typedef void(*ConnListenerSetViewport)(uint16_t x, uint16_t y, uint16_t width, u
 // forwarder that calls setViewport with the first six arguments, so existing
 // callers keep working unchanged. If it is set, setViewport is NOT called for
 // the same echo.
+//
+// Like setViewport, echoes still queued behind a newer one when the callback
+// thread gets to them are dropped, so a caller can see frameIndex jump past an
+// intermediate echo. Only the latest applied rectangle is ever delivered.
 typedef void(*ConnListenerSetViewportV2)(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
                                          uint16_t desktopWidth, uint16_t desktopHeight,
                                          uint32_t frameIndex);
@@ -728,6 +732,11 @@ int LiSendViewportEventForced(uint16_t x, uint16_t y, uint16_t width, uint16_t h
 // The subscription does not survive the connection. Call it again after every
 // LiStartConnection().
 //
+// Nothing tells the client in advance whether a host implements this, and a
+// host that doesn't silently ignores the message. Callers that want stock hosts
+// never to see it should only send it once the host has proven it runs the meow
+// extensions (e.g. after a ConnListenerSetViewport/V2 echo).
+//
 // This may be called from any thread between LiStartConnection() and
 // LiStopConnection(). It sends a reliable message and can block the caller for
 // up to ~10 ms under backpressure.
@@ -770,7 +779,9 @@ typedef struct _MEOW_RECEIVER_REPORT {
 
 // This function sends a receiver report to the host. The host answers bitrate
 // changes through ConnListenerBitrateApplied. Hosts that don't implement the
-// extension ignore it.
+// extension ignore it; see LiSendCursorSubscribe() for gating on a proven meow
+// host, and consider stopping when no ConnListenerBitrateApplied has arrived
+// after the first few reports.
 //
 // This may be called from any thread between LiStartConnection() and
 // LiStopConnection(). It sends a reliable message and can block the caller for
@@ -1126,6 +1137,14 @@ const RTP_VIDEO_STATS* LiGetRTPVideoStats(void);
 // snapshot), so clamp it at 0. The fields are updated by the video receive
 // thread without a lock, so a snapshot is not atomic across fields; the skew is
 // at most a few packets.
+//
+// packetsExpected advances with the RTP sequence numbers of received packets
+// (authenticated when video encryption is enabled), so packets lost during an
+// outage are counted once the stream resumes. packetsReceived and
+// bytesReceived count every well-sized datagram on the video socket, before
+// decryption, because the late FEC shards of an already reassembled frame are
+// dropped undecrypted; bytesReceived therefore includes the per-packet
+// encryption header when video encryption is enabled.
 typedef struct _MEOW_VIDEO_NETWORK_STATS {
     uint32_t packetsReceived;  // video data and FEC packets that arrived
     uint32_t packetsExpected;  // video data and FEC packets the host sent
